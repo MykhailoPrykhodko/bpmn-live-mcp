@@ -11,6 +11,7 @@ const {
 const { JSDOM } = require("jsdom");
 const fs = require("fs");
 const path = require("path");
+const { PreviewServer, PreviewConflictError } = require("./preview-server");
 
 let BpmnModeler: any;
 let jsdomInstance: any;
@@ -18,11 +19,60 @@ let jsdomInstance: any;
 interface DiagramState {
   modeler: any;
   xml: string;
+  revision: number;
+  lastModifiedAt: string;
+  lastModifiedSource: "mcp" | "modeler";
   elementIdMap: Map<string, string>;
+  operation: Promise<void>;
 }
 
 // In-memory storage for diagrams (keyed by diagram ID)
 const diagrams = new Map<string, DiagramState>();
+
+async function withDiagramLock<T>(diagram: DiagramState, action: () => Promise<T>): Promise<T> {
+  const previous = diagram.operation;
+  let release!: () => void;
+  diagram.operation = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+  }
+}
+
+const previewServer = new PreviewServer((diagramId: string) => {
+  const diagram = diagrams.get(diagramId);
+  if (!diagram) return undefined;
+
+  return {
+    getXml: () => withDiagramLock(diagram, async () => {
+      const { xml } = await diagram.modeler.saveXML({ format: true });
+      diagram.xml = xml || "";
+      return { xml: diagram.xml, revision: diagram.revision };
+    }),
+    saveXml: (xml: string, expectedRevision: number) => withDiagramLock(diagram, async () => {
+      if (expectedRevision !== diagram.revision) {
+        throw new PreviewConflictError(diagram.revision);
+      }
+
+      const replacementModeler = new BpmnModeler({ container: createHeadlessCanvas() });
+      await replacementModeler.importXML(xml);
+      const saved = await replacementModeler.saveXML({ format: true });
+      const previousModeler = diagram.modeler;
+      diagram.modeler = replacementModeler;
+      previousModeler.destroy?.();
+      diagram.xml = saved.xml || "";
+      markDiagramModified(diagram, "modeler");
+      diagram.elementIdMap.clear();
+
+      return { xml: diagram.xml, revision: diagram.revision };
+    }),
+  };
+});
 
 // Create a headless canvas for bpmn-js
 function createHeadlessCanvas(): any {
@@ -190,7 +240,10 @@ function createHeadlessCanvas(): any {
     BpmnModeler = (jsdomInstance.window as any).BpmnJS;
   }
 
-  return jsdomInstance.window.document.getElementById("canvas")!;
+  const canvas = jsdomInstance.window.document.createElement("div");
+  canvas.className = "bpmn-headless-canvas";
+  jsdomInstance.window.document.body.appendChild(canvas);
+  return canvas;
 }
 
 // Create a new BPMN modeler instance
@@ -221,6 +274,90 @@ async function createModeler(): Promise<any> {
 // Generate a unique diagram ID
 function generateDiagramId(): string {
   return `diagram_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+function getDiagramElements(diagram: DiagramState): any[] {
+  const elementRegistry = diagram.modeler.get("elementRegistry");
+  return elementRegistry.filter((element: any) => {
+    return element.type &&
+      element.type !== "bpmn:Process" &&
+      element.type !== "bpmn:Collaboration" &&
+      element.type !== "label" &&
+      !element.type.includes("BPMNDiagram");
+  });
+}
+
+function getDocumentation(element: any): string[] {
+  return (element.businessObject?.documentation || [])
+    .map((entry: any) => entry.text)
+    .filter((text: any): text is string => typeof text === "string");
+}
+
+function summarizeElement(element: any): Record<string, any> {
+  const businessObject = element.businessObject || {};
+  const eventDefinitions = (businessObject.eventDefinitions || [])
+    .map((definition: any) => definition.$type)
+    .filter(Boolean);
+  const extensionTypes = (businessObject.extensionElements?.values || [])
+    .map((extension: any) => extension.$type)
+    .filter(Boolean);
+
+  return {
+    id: element.id,
+    type: businessObject.$type || element.type,
+    name: businessObject.name || "(unnamed)",
+    parentId: element.parent?.id,
+    hostId: element.host?.id || businessObject.attachedToRef?.id,
+    sourceId: element.source?.id,
+    targetId: element.target?.id,
+    x: element.x,
+    y: element.y,
+    width: element.width,
+    height: element.height,
+    properties: {
+      documentation: getDocumentation(element),
+      eventDefinitions,
+      extensionTypes,
+      isExpanded: element.collapsed === undefined ? undefined : !element.collapsed,
+      isInterrupting: businessObject.isInterrupting,
+      cancelActivity: businessObject.cancelActivity,
+      isForCompensation: businessObject.isForCompensation,
+      triggeredByEvent: businessObject.triggeredByEvent,
+      calledElement: businessObject.calledElement,
+    },
+  };
+}
+
+function markDiagramModified(diagram: DiagramState, source: "mcp" | "modeler" = "mcp"): void {
+  diagram.revision += 1;
+  diagram.lastModifiedAt = new Date().toISOString();
+  diagram.lastModifiedSource = source;
+}
+
+function diagramInspection(diagramId: string, diagram: DiagramState, includeXml: boolean): Record<string, any> {
+  const elements = getDiagramElements(diagram).map(summarizeElement);
+  const counts: Record<string, number> = {};
+
+  for (const element of elements) {
+    counts[element.type] = (counts[element.type] || 0) + 1;
+  }
+
+  const inspection: Record<string, any> = {
+    success: true,
+    diagramId,
+    revision: diagram.revision,
+    lastModifiedAt: diagram.lastModifiedAt,
+    lastModifiedSource: diagram.lastModifiedSource,
+    elementCount: elements.length,
+    counts,
+    elements,
+  };
+
+  if (includeXml) {
+    inspection.xml = diagram.xml;
+  }
+
+  return inspection;
 }
 
 const server = new Server(
@@ -267,6 +404,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: [
                 "bpmn:StartEvent",
                 "bpmn:EndEvent",
+                "bpmn:BoundaryEvent",
                 "bpmn:Task",
                 "bpmn:UserTask",
                 "bpmn:ServiceTask",
@@ -279,9 +417,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 "bpmn:ParallelGateway",
                 "bpmn:InclusiveGateway",
                 "bpmn:EventBasedGateway",
+                "bpmn:ComplexGateway",
                 "bpmn:IntermediateCatchEvent",
                 "bpmn:IntermediateThrowEvent",
                 "bpmn:SubProcess",
+                "bpmn:CallActivity",
+                "bpmn:DataObjectReference",
+                "bpmn:DataStoreReference",
+                "bpmn:TextAnnotation",
+                "bpmn:Group",
+                "bpmn:Participant",
+                "bpmn:Lane",
               ],
               description: "The type of BPMN element to add",
             },
@@ -297,13 +443,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Y coordinate for the element (default: 100)",
             },
+            parentElementId: {
+              type: "string",
+              description: "Optional parent container ID, required for lanes and nested elements",
+            },
+            hostElementId: {
+              type: "string",
+              description: "Host element ID for boundary events",
+            },
+            isExpanded: {
+              type: "boolean",
+              description: "Whether a subprocess or participant is expanded",
+            },
+            eventDefinitionType: {
+              type: "string",
+              description: "Optional event definition type, for example bpmn:TimerEventDefinition",
+            },
           },
           required: ["diagramId", "elementType"],
         },
       },
       {
         name: "connect_bpmn_elements",
-        description: "Connect two BPMN elements with a sequence flow",
+        description: "Connect two BPMN elements with a BPMN connection",
         inputSchema: {
           type: "object",
           properties: {
@@ -321,7 +483,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             label: {
               type: "string",
-              description: "Optional label for the sequence flow",
+              description: "Optional label for the connection",
+            },
+            connectionType: {
+              type: "string",
+              enum: [
+                "bpmn:SequenceFlow",
+                "bpmn:MessageFlow",
+                "bpmn:Association",
+                "bpmn:DataInputAssociation",
+                "bpmn:DataOutputAssociation",
+                "bpmn:ConversationLink",
+              ],
+              description: "BPMN connection type (defaults to bpmn:SequenceFlow)",
             },
           },
           required: ["diagramId", "sourceElementId", "targetElementId"],
@@ -356,14 +530,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "list_bpmn_elements",
-        description: "List all elements in a BPMN diagram",
+        name: "open_bpmn_modeler",
+        description: "Open a live local bpmn-js modeler for a BPMN diagram. Browser edits are saved to the MCP session when the user clicks Save.",
         inputSchema: {
           type: "object",
           properties: {
             diagramId: {
               type: "string",
               description: "The diagram ID",
+            },
+            openBrowser: {
+              type: "boolean",
+              description: "Open the returned modeler URL in the default browser",
+              default: false,
+            },
+          },
+          required: ["diagramId"],
+        },
+      },
+      {
+        name: "close_bpmn_modeler",
+        description: "Close a live local bpmn-js modeler preview URL",
+        inputSchema: {
+          type: "object",
+          properties: {
+            token: {
+              type: "string",
+              description: "The preview token returned by open_bpmn_modeler",
+            },
+          },
+          required: ["token"],
+        },
+      },
+      {
+        name: "inspect_bpmn_modeler",
+        description: "Inspect the latest diagram state behind a live bpmn-js modeler URL using its preview token",
+        inputSchema: {
+          type: "object",
+          properties: {
+            token: {
+              type: "string",
+              description: "The preview token from the modeler URL or open_bpmn_modeler",
+            },
+            includeXml: {
+              type: "boolean",
+              description: "Include the complete normalized BPMN XML",
+              default: false,
+            },
+          },
+          required: ["token"],
+        },
+      },
+      {
+        name: "list_bpmn_elements",
+        description: "List all current BPMN elements, connections, containers, and relationships",
+        inputSchema: {
+          type: "object",
+          properties: {
+            diagramId: {
+              type: "string",
+              description: "The diagram ID",
+            },
+          },
+          required: ["diagramId"],
+        },
+      },
+      {
+        name: "inspect_bpmn_diagram",
+        description: "Inspect the latest BPMN diagram state, including edits saved from the browser modeler",
+        inputSchema: {
+          type: "object",
+          properties: {
+            diagramId: {
+              type: "string",
+              description: "The diagram ID",
+            },
+            includeXml: {
+              type: "boolean",
+              description: "Include the complete normalized BPMN XML",
+              default: false,
             },
           },
           required: ["diagramId"],
@@ -401,7 +646,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         diagrams.set(diagramId, {
           modeler,
           xml: xml || "",
+          revision: 0,
+          lastModifiedAt: new Date().toISOString(),
+          lastModifiedSource: "mcp",
           elementIdMap: new Map(),
+          operation: Promise.resolve(),
         });
 
         return {
@@ -419,7 +668,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
       }
 
       case "add_bpmn_element": {
-        const { diagramId, elementType, name: elementName, x = 100, y = 100 } = args as any;
+        const {
+          diagramId,
+          elementType,
+          name: elementName,
+          x = 100,
+          y = 100,
+          parentElementId,
+          hostElementId,
+          isExpanded,
+          eventDefinitionType,
+        } = args as any;
         const diagram = diagrams.get(diagramId);
 
         if (!diagram) {
@@ -429,23 +688,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         const modeling = diagram.modeler.get("modeling");
         const elementFactory = diagram.modeler.get("elementFactory");
         const elementRegistry = diagram.modeler.get("elementRegistry");
+        const canvas = diagram.modeler.get("canvas");
+        const root = canvas.getRootElement();
 
-        // Get the process element
-        const process = elementRegistry.filter((element: any) => {
-          return element.type === "bpmn:Process";
+        const participant = elementRegistry.filter((element: any) => {
+          return element.type === "bpmn:Participant";
         })[0];
+        const defaultParent = root.type === "bpmn:Process" ? root : participant || root;
+        const parent = parentElementId
+          ? elementRegistry.get(parentElementId)
+          : elementType === "bpmn:Participant" ? root : defaultParent;
+        if (!parent) {
+          throw new McpError(ErrorCode.InvalidRequest, `Parent element not found: ${parentElementId}`);
+        }
 
-        // Create the shape
-        const shape = elementFactory.createShape({ type: elementType });
-        const createdElement = modeling.createShape(
-          shape,
-          { x, y },
-          process
-        );
+        let createdElement: any;
+
+        if (elementType === "bpmn:Lane") {
+          if (!parent || !["bpmn:Lane", "bpmn:Participant"].includes(parent.type)) {
+            throw new McpError(ErrorCode.InvalidRequest, "A lane must be added to a participant or existing lane");
+          }
+
+          createdElement = modeling.addLane(parent, "bottom");
+        } else {
+          const attrs: Record<string, any> = {
+            type: elementType,
+            isExpanded,
+            eventDefinitionType,
+          };
+
+          if (elementType === "bpmn:Participant") {
+            attrs.isExpanded = isExpanded !== false;
+          }
+
+          const shape = elementType === "bpmn:Participant"
+            ? elementFactory.createParticipantShape(attrs)
+            : elementFactory.createShape(attrs);
+          const host = hostElementId ? elementRegistry.get(hostElementId) : undefined;
+
+          if (hostElementId && !host) {
+            throw new McpError(ErrorCode.InvalidRequest, `Host element not found: ${hostElementId}`);
+          }
+
+          createdElement = modeling.createShape(
+            shape,
+            { x, y },
+            host || parent,
+            host ? { attach: true } : undefined,
+          );
+        }
 
         // Set the name if provided
         if (elementName) {
-          modeling.updateProperties(createdElement, { name: elementName });
+          modeling.updateLabel(createdElement, elementName);
         }
 
         // Store the element ID
@@ -454,6 +749,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         // Update stored XML
         const { xml } = await diagram.modeler.saveXML({ format: true });
         diagram.xml = xml || "";
+        markDiagramModified(diagram);
 
         // Check if this element should typically be connected
         const needsConnection = elementType.includes('Event') || elementType.includes('Task') || elementType.includes('Gateway');
@@ -477,7 +773,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
       }
 
       case "connect_bpmn_elements": {
-        const { diagramId, sourceElementId, targetElementId, label } = args as any;
+        const {
+          diagramId,
+          sourceElementId,
+          targetElementId,
+          label,
+          connectionType = "bpmn:SequenceFlow",
+        } = args as any;
         const diagram = diagrams.get(diagramId);
 
         if (!diagram) {
@@ -499,8 +801,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
 
         // Create connection
         const connection = modeling.connect(source, target, {
-          type: "bpmn:SequenceFlow",
+          type: connectionType,
         });
+
+        if (!connection) {
+          throw new McpError(
+            ErrorCode.InvalidRequest,
+            `Cannot create ${connectionType} between ${sourceElementId} and ${targetElementId}`,
+          );
+        }
 
         // Set label if provided
         if (label) {
@@ -510,6 +819,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         // Update stored XML
         const { xml } = await diagram.modeler.saveXML({ format: true });
         diagram.xml = xml || "";
+        markDiagramModified(diagram);
 
         return {
           content: [
@@ -536,19 +846,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         const { xml } = await diagram.modeler.saveXML({ format: true });
 
         // Check for disconnected elements
-        const elementRegistry = diagram.modeler.get("elementRegistry");
-        const elements = elementRegistry.filter((element: any) => {
-          return element.type && (element.type.includes('Event') || element.type.includes('Task') || element.type.includes('Gateway'));
-        });
-        const sequenceFlows = elementRegistry.filter((element: any) => {
-          return element.type === "bpmn:SequenceFlow";
-        });
+        const elements = getDiagramElements(diagram);
+        const connectionTypes = new Set([
+          "bpmn:SequenceFlow",
+          "bpmn:MessageFlow",
+          "bpmn:Association",
+          "bpmn:DataInputAssociation",
+          "bpmn:DataOutputAssociation",
+          "bpmn:ConversationLink",
+        ]);
+        const nodes = elements.filter((element: any) => !connectionTypes.has(element.businessObject?.$type || element.type));
+        const connections = elements.filter((element: any) => connectionTypes.has(element.businessObject?.$type || element.type));
 
         const warnings: string[] = [];
-        if (elements.length > 1 && sequenceFlows.length === 0) {
-          warnings.push(`⚠️ Note: Diagram has ${elements.length} elements but no sequence flows. Workflows typically need connections between elements. Use connect_bpmn_elements to add flows.`);
-        } else if (elements.length > sequenceFlows.length + 1) {
-          warnings.push(`💡 Tip: ${elements.length} elements with ${sequenceFlows.length} sequence flows - some elements may be disconnected.`);
+        if (nodes.length > 1 && connections.length === 0) {
+          warnings.push(`Note: Diagram has ${nodes.length} BPMN nodes but no connections. Use connect_bpmn_elements to add flows.`);
+        } else if (nodes.length > connections.length + 1) {
+          warnings.push(`Tip: ${nodes.length} BPMN nodes with ${connections.length} connections; some elements may be disconnected.`);
         }
 
         return {
@@ -585,6 +899,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         };
       }
 
+      case "open_bpmn_modeler": {
+        const { diagramId, openBrowser = false } = args as any;
+        const preview = await previewServer.open(diagramId, Boolean(openBrowser));
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                diagramId,
+                token: preview.token,
+                url: preview.url,
+                port: preview.port,
+                message: `Open the live BPMN modeler at ${preview.url}. Click Save to write browser edits to the MCP session.`,
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "close_bpmn_modeler": {
+        const { token } = args as any;
+        const closed = previewServer.close(token);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                token,
+                closed,
+                message: closed ? "BPMN modeler preview closed" : "BPMN modeler preview was not found",
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "inspect_bpmn_modeler": {
+        const { token, includeXml = false } = args as any;
+        const preview = await previewServer.inspect(token);
+        const diagram = diagrams.get(preview.diagramId);
+
+        if (!diagram) {
+          throw new McpError(ErrorCode.InvalidRequest, `Diagram not found: ${preview.diagramId}`);
+        }
+
+        const inspection = diagramInspection(preview.diagramId, diagram, Boolean(includeXml));
+        inspection.modelerToken = token;
+        inspection.modelerExpiresAt = preview.expiresAt;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(inspection, null, 2),
+            },
+          ],
+        };
+      }
+
       case "list_bpmn_elements": {
         const { diagramId } = args as any;
         const diagram = diagrams.get(diagramId);
@@ -593,25 +970,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
           throw new McpError(ErrorCode.InvalidRequest, `Diagram not found: ${diagramId}`);
         }
 
-        const elementRegistry = diagram.modeler.get("elementRegistry");
-        const elements = elementRegistry.filter((element: any) => {
-          // Filter out root elements and connections for cleaner output
-          return element.type &&
-                 element.type !== "bpmn:Process" &&
-                 element.type !== "bpmn:Collaboration" &&
-                 element.type !== "label" &&
-                 !element.type.includes("BPMNDiagram");
+        const elementList = await withDiagramLock(diagram, async () => {
+          return getDiagramElements(diagram).map(summarizeElement);
         });
-
-        const elementList = elements.map((element: any) => ({
-          id: element.id,
-          type: element.type,
-          name: element.businessObject?.name || "(unnamed)",
-          x: element.x,
-          y: element.y,
-          width: element.width,
-          height: element.height,
-        }));
 
         return {
           content: [
@@ -619,9 +980,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
               type: "text",
               text: JSON.stringify({
                 success: true,
+                diagramId,
+                revision: diagram.revision,
+                lastModifiedAt: diagram.lastModifiedAt,
+                lastModifiedSource: diagram.lastModifiedSource,
                 elements: elementList,
                 count: elementList.length,
               }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "inspect_bpmn_diagram": {
+        const { diagramId, includeXml = false } = args as any;
+        const diagram = diagrams.get(diagramId);
+
+        if (!diagram) {
+          throw new McpError(ErrorCode.InvalidRequest, `Diagram not found: ${diagramId}`);
+        }
+
+        const inspection = await withDiagramLock(diagram, async () => {
+          const { xml } = await diagram.modeler.saveXML({ format: true });
+          diagram.xml = xml || "";
+          return diagramInspection(diagramId, diagram, Boolean(includeXml));
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(inspection, null, 2),
             },
           ],
         };
@@ -639,7 +1028,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         diagrams.set(diagramId, {
           modeler,
           xml,
+          revision: 1,
+          lastModifiedAt: new Date().toISOString(),
+          lastModifiedSource: "mcp",
           elementIdMap: new Map(),
+          operation: Promise.resolve(),
         });
 
         return {
@@ -680,7 +1073,14 @@ async function main() {
   console.error("BPMN.js MCP server running on stdio");
 }
 
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    void previewServer.stop().finally(() => process.exit(0));
+  });
+}
+
 main().catch((error) => {
+  void previewServer.stop();
   console.error("Fatal error in main():", error);
   process.exit(1);
 });

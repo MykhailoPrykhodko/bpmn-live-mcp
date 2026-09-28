@@ -11,13 +11,15 @@ A Model Context Protocol (MCP) server for creating and manipulating BPMN 2.0 wor
 - **Connect Elements**: Create sequence flows between workflow components
 - **Export Formats**: Save diagrams as BPMN 2.0 XML or SVG
 - **Import Support**: Load and modify existing BPMN XML files
+- **Live Modeler**: Open a local bpmn-js modeler and explicitly save changes to the MCP session
+- **Native Palette**: Use the full bpmn-js palette and context pad in the browser modeler
 - **Smart Hints**: Get helpful nudges to ensure complete workflows with proper connections
 
 ## Installation
 
 ### Prerequisites
 
-- Node.js (v16 or higher)
+- Node.js (v18 or higher)
 - npm or yarn
 
 ### Local Setup
@@ -99,6 +101,22 @@ Create a BPMN diagram for customer support ticket routing:
 - Both paths lead to: Ticket Resolved (end)
 ```
 
+### Opening the Live Modeler
+
+After creating or importing a diagram, open a browser-based modeler without exporting a file:
+
+```
+Open the live BPMN modeler for diagram diagram_123
+```
+
+The `open_bpmn_modeler` tool returns a local URL. Open that URL in a browser to edit the diagram with bpmn-js. Browser changes remain local until you click **Save** or press `Ctrl/Cmd + S`, then they are saved back to the active MCP diagram session.
+
+The modeler includes local-file open and drag-and-drop, a guarded **New** action that resets the active diagram, undo/redo, zoom and fullscreen controls, keyboard shortcuts, and downloads for both `diagram.bpmn` and `diagram.svg`.
+
+The modeler runs on loopback only (`127.0.0.1`). The URL is tokenized and expires after one hour. If MCP changes the diagram while the browser has unsaved edits, the modeler reports a conflict instead of overwriting the newer change.
+
+To inspect the same live modeler session from chat, copy the token after `/modeler/` in the URL and call `inspect_bpmn_modeler`. The token is tied to the running MCP process and becomes invalid after that process restarts.
+
 ## Available Tools
 
 The MCP server provides these tools:
@@ -110,11 +128,14 @@ Creates a new BPMN diagram and returns a diagram ID.
 Adds an element to the diagram. Supported types:
 - Events: `bpmn:StartEvent`, `bpmn:EndEvent`, `bpmn:IntermediateCatchEvent`, `bpmn:IntermediateThrowEvent`
 - Tasks: `bpmn:Task`, `bpmn:UserTask`, `bpmn:ServiceTask`, `bpmn:ScriptTask`, `bpmn:ManualTask`, `bpmn:BusinessRuleTask`, `bpmn:SendTask`, `bpmn:ReceiveTask`
-- Gateways: `bpmn:ExclusiveGateway`, `bpmn:ParallelGateway`, `bpmn:InclusiveGateway`, `bpmn:EventBasedGateway`
-- Other: `bpmn:SubProcess`
+- Gateways: `bpmn:ExclusiveGateway`, `bpmn:ParallelGateway`, `bpmn:InclusiveGateway`, `bpmn:EventBasedGateway`, `bpmn:ComplexGateway`
+- Containers and artifacts: `bpmn:SubProcess`, `bpmn:CallActivity`, `bpmn:Participant`, `bpmn:Lane`, `bpmn:DataObjectReference`, `bpmn:DataStoreReference`, `bpmn:TextAnnotation`, `bpmn:Group`
+- Boundary events: `bpmn:BoundaryEvent`
+
+Use `parentElementId` for lanes and nested elements, `hostElementId` for boundary events, and `eventDefinitionType` for typed events.
 
 ### `connect_bpmn_elements`
-Creates a sequence flow between two elements.
+Creates a BPMN connection between two elements. Supported connection types include sequence flows, message flows, associations, data associations, and conversation links.
 
 ### `export_bpmn_xml`
 Exports the diagram as BPMN 2.0 XML format.
@@ -122,8 +143,20 @@ Exports the diagram as BPMN 2.0 XML format.
 ### `export_bpmn_svg`
 Exports the diagram as SVG for visualization.
 
+### `open_bpmn_modeler`
+Starts a local browser-based bpmn-js modeler for a diagram and returns a tokenized URL. Browser edits are explicitly saved to the MCP session using revision checks.
+
+### `close_bpmn_modeler`
+Revokes a modeler URL before its normal expiration.
+
+### `inspect_bpmn_modeler`
+Resolves a live modeler URL token to its MCP diagram and returns the latest inspection data. Use the token from the URL when the diagram ID is not available in chat.
+
 ### `list_bpmn_elements`
-Lists all elements in a diagram.
+Lists all current elements, connections, containers, relationships, and revision metadata, including browser modeler edits.
+
+### `inspect_bpmn_diagram`
+Returns a chat-friendly summary of the latest diagram state, including element counts, properties, relationships, revision, and the last modification source. Set `includeXml` to `true` to include normalized BPMN XML.
 
 ### `import_bpmn_xml`
 Imports an existing BPMN XML file for editing.
@@ -183,6 +216,12 @@ Then send JSON-RPC requests via stdin. Example:
 {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
 ```
 
+Run the automated modeler and MCP integration tests with:
+
+```bash
+npm test
+```
+
 ## Technical Details
 
 ### Architecture
@@ -191,6 +230,7 @@ Then send JSON-RPC requests via stdin. Example:
 - **BPMN Engine**: bpmn-js (headless mode with jsdom)
 - **Protocol**: Model Context Protocol (MCP)
 - **Output**: BPMN 2.0 XML standard
+- **Live UI**: Local HTTP modeler using the bpmn-js browser bundle
 
 ### Smart Workflow Hints
 
