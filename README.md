@@ -54,19 +54,19 @@ Add the following to your Claude Desktop configuration file:
   "mcpServers": {
     "bpmn": {
       "command": "node",
-      "args": ["/absolute/path/to/BPMN-MCP/dist/index.js"]
+      "args": ["/absolute/path/to/bpmn-live-mcp/dist/index.js"]
     }
   }
 }
 ```
 
-Replace `/absolute/path/to/BPMN-MCP` with the actual path where you cloned this repository.
+Replace `/absolute/path/to/bpmn-live-mcp` with the actual path where you cloned this repository.
 
 ### For Other AI Tools
 
 This MCP server works with any tool that supports the Model Context Protocol. Configure it to run:
 ```bash
-node /path/to/BPMN-MCP/dist/index.js
+node /absolute/path/to/bpmn-live-mcp/dist/index.js
 ```
 
 ### For OpenCode
@@ -80,14 +80,14 @@ Add the server to an OpenCode project configuration at `.opencode/opencode.json`
     "bpmn": {
       "type": "local",
       "command": ["node", "dist/index.js"],
-      "cwd": "C:\\Users\\mprykhodko\\Projects\\BPMN-MCP",
+      "cwd": "/absolute/path/to/bpmn-live-mcp",
       "enabled": true
     }
   }
 }
 ```
 
-Use the absolute path to your local `BPMN-MCP` project in `cwd`. Build the server before using it:
+Use the absolute path to your local `bpmn-live-mcp` project in `cwd`. Build the server before using it:
 
 ```bash
 npm install
