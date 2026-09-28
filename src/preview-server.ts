@@ -103,6 +103,18 @@ export class PreviewServer {
     return this.previews.delete(token);
   }
 
+  /** Revokes every modeler URL that points at `diagramId`; returns how many were removed. */
+  closeForDiagram(diagramId: string): number {
+    let removed = 0;
+    for (const [token, preview] of this.previews) {
+      if (preview.diagramId === diagramId) {
+        this.previews.delete(token);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
   async inspect(token: string): Promise<PreviewInspection> {
     this.pruneExpiredPreviews();
     const preview = this.previews.get(token);

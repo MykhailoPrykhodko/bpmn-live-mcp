@@ -1,6 +1,6 @@
 # BPMN Live MCP
 
-A Model Context Protocol (MCP) server for creating and manipulating BPMN 2.0 workflow diagrams programmatically. This server enables AI assistants and other tools to generate, edit, and export business process diagrams in the standard BPMN format.
+A Model Context Protocol (MCP) server for creating and manipulating [BPMN 2.0](https://www.omg.org/spec/BPMN/2.0/) workflow diagrams programmatically. This server enables AI assistants and other tools to generate, edit, and export business process diagrams in the standard BPMN format.
 
 ![BPMN Diagram Example](./docs/images/bpmn.png)
 
@@ -14,6 +14,8 @@ A Model Context Protocol (MCP) server for creating and manipulating BPMN 2.0 wor
 - **Live Modeler**: Open a local bpmn-js modeler and explicitly save changes to the MCP session
 - **Native Palette**: Use the full bpmn-js palette and context pad in the browser modeler
 - **Smart Hints**: Get helpful nudges to ensure complete workflows with proper connections
+- **Automatic Placement**: Elements added without coordinates are laid out left-to-right instead of stacking
+- **Session Management**: List and delete diagrams; idle diagrams expire automatically
 
 ## Installation
 
@@ -95,6 +97,58 @@ npm run build
 ```
 
 Restart OpenCode after changing its MCP configuration. You can then ask OpenCode to create, inspect, edit, or export BPMN diagrams using the `bpmn` MCP tools.
+
+## Running as a Persistent Server (Recommended)
+
+By default (`dist/index.js`), this MCP server runs over **stdio**: your AI client spawns it as a child process and owns its entire lifetime. If that client restarts, disconnects, or is killed, the server (and every open diagram/modeler session) dies with it - including any diagram you were actively editing in the live modeler.
+
+For a more robust setup, run the server as a **standalone HTTP process** instead. Start it once, leave it running, and point any number of MCP clients at it over the network. Diagrams and modeler sessions then live in that one long-running process, independent of any single client connection.
+
+### Starting the HTTP server
+
+```bash
+npm run build
+npm run start:http
+```
+
+This starts an MCP server listening on `http://127.0.0.1:3939/mcp` (loopback only, by default). You'll see:
+
+```text
+bpmn-js-mcp v1.1.0 listening on http://127.0.0.1:3939/mcp
+This process runs independently of any MCP client; leave it running and connect to it over HTTP.
+```
+
+Leave that terminal open (or run it under a process manager such as `pm2`, `nssm`, or a systemd/Windows service) and connect to it from your AI tool.
+
+### Configuration
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `BPMN_MCP_HTTP_HOST` | `127.0.0.1` | Host to bind to. Keep this loopback-only unless you have a specific reason to expose it, since diagram editing has no authentication. |
+| `BPMN_MCP_HTTP_PORT` | `3939` | Port to listen on. |
+| `BPMN_MCP_DIAGRAM_TTL_MINUTES` | `1440` (24h) | Same as stdio mode: idle diagrams are freed after this long. |
+| `BPMN_MCP_MAX_DIAGRAMS` | `50` | Same as stdio mode: cap on concurrently held diagrams. |
+
+### Connecting OpenCode to the HTTP server
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "bpmn": {
+      "type": "remote",
+      "url": "http://127.0.0.1:3939/mcp",
+      "enabled": true
+    }
+  }
+}
+```
+
+Unlike the `local` configuration above, OpenCode does not spawn or manage this process - it only connects to it. Start `npm run start:http` yourself, once, and it stays available across OpenCode restarts, new chat sessions, and even OpenCode crashes.
+
+### Connecting other MCP clients
+
+Any client that supports the MCP **Streamable HTTP** transport can connect the same way: point it at `http://127.0.0.1:3939/mcp`. The server issues a session id on `initialize` (via the `mcp-session-id` response header) and expects it echoed back on every subsequent request, per the standard MCP Streamable HTTP session lifecycle.
 
 ## Usage
 
@@ -216,6 +270,33 @@ Returns a chat-friendly summary of the latest diagram state, including element c
 ### `import_bpmn_xml`
 Imports an existing BPMN XML file for editing.
 
+### `list_bpmn_diagrams`
+
+Lists the diagrams held in the current MCP session (ID, name, revision, timestamps).
+
+### `delete_bpmn_diagram`
+
+Deletes a diagram, frees its resources and revokes any open modeler links for it.
+
+## Automatic Placement
+
+`add_bpmn_element` accepts optional `x` / `y` (element centre). When they are omitted the server picks a position:
+
+- Flow nodes continue left-to-right after the right-most flow node in the same container (process, participant, lane or sub-process), on the same row.
+- Data objects, data stores, annotations and groups are placed above the flow.
+- Boundary events attach to the bottom edge of their host.
+- Participants stack vertically.
+
+Branching flows (for example the two outgoing paths of a gateway) still need explicit `y` values to sit on separate rows. The response always reports the position that was used.
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BPMN_MCP_DIAGRAM_TTL_MINUTES` | `1440` | Dispose diagrams that were idle this long (`0` disables expiry) |
+| `BPMN_MCP_MAX_DIAGRAMS` | `50` | Maximum diagrams held at once (`0` disables the cap) |
+| `BPMN_MCP_BUNDLE` | `production` | Set to `development` to load the unminified bpmn-js bundle for debugging |
+
 ## Example Output
 
 The server generates standard BPMN 2.0 XML files that can be opened in:
@@ -277,6 +358,8 @@ Run the automated modeler and MCP integration tests with:
 npm test
 ```
 
+This includes `http-server.test.js`, which spawns `dist/http-server.js` as a real subprocess and drives it over the MCP Streamable HTTP protocol - the same code path used in [Running as a Persistent Server](#running-as-a-persistent-server-recommended).
+
 ## Technical Details
 
 ### Architecture
@@ -286,6 +369,7 @@ npm test
 - **Protocol**: Model Context Protocol (MCP)
 - **Output**: BPMN 2.0 XML standard
 - **Live UI**: Local HTTP modeler using the bpmn-js browser bundle
+- **Entry points**: `src/index.ts` (stdio, client-spawned) and `src/http-server.ts` (persistent HTTP server, see [Running as a Persistent Server](#running-as-a-persistent-server-recommended)) both build on the shared engine in `src/mcp-server.ts`, so tool behavior is identical regardless of transport.
 
 ### Smart Workflow Hints
 
@@ -310,5 +394,61 @@ For issues or questions:
 
 ## Related Projects
 
+- [BPMN 2.0 specification (OMG)](https://www.omg.org/spec/BPMN/2.0/) - The standard this server produces
+- [bpmn.io](https://bpmn.io/) - Open-source BPMN tooling, including a [web modeler](https://demo.bpmn.io/) for viewing exported diagrams
 - [bpmn-js](https://bpmn.io/toolkit/bpmn-js/) - BPMN 2.0 rendering toolkit
 - [Model Context Protocol](https://modelcontextprotocol.io/) - Protocol specification
+
+## Changes
+
+### 1.2.0
+
+**Bug fixes**
+
+- **stdio corruption / "MCP error -32001" on every call after the first diagram:** `jsdom`'s default virtual console forwarded jsdom-internal events (CSS/SVG warnings, unimplemented-API notices) straight to Node's real `console`, which writes to `process.stdout` - the exact byte stream the stdio MCP transport uses to frame JSON-RPC. A single such event corrupted the stream and made every later response unparseable to the client (visible as generic request timeouts starting right after the first `create_bpmn_diagram`). jsdom's console is now routed to `console.error` (stderr) instead, so it can never interleave with JSON-RPC on stdout.
+- **A single stuck diagram operation could wedge the whole diagram forever:** every operation on a diagram is serialised through a per-diagram lock; there was no bound on how long a locked operation could run, so one hung `import`/`saveXML` call blocked every later request on that diagram indefinitely (observed as sockets piling up in `CLOSE_WAIT` and the browser modeler's own requests failing with "signal is aborted without reason" after its 10s timeout). Locked operations are now bounded by `BPMN_MCP_OPERATION_TIMEOUT_MS` (default 20s); a stuck operation now fails cleanly and releases the lock instead of blocking the diagram forever.
+
+**Additions**
+
+- **New HTTP transport (`src/http-server.ts`, `npm run start:http`):** run the server as a persistent local process that any number of MCP clients connect to over `http://127.0.0.1:3939/mcp`, instead of each client spawning and owning it over stdio. This decouples diagram/modeler session lifetime from any single client connection - the concrete case reported was a live modeler session dying after roughly ten minutes; the underlying stdio process was proven stable well past that window in isolation (an 11-minute soak test with periodic tool calls never failed), so the death was in how the *client* hosted the child process, not in the server itself. Running the server out-of-process via HTTP sidesteps that entirely: a soak test against the HTTP transport ran the browser modeler's exact polling pattern (one `GET /xml` per second) for 10.5 minutes with zero failures, then a save. See [Running as a Persistent Server](#running-as-a-persistent-server-recommended).
+- Server-side logic is now shared between both entry points via `src/mcp-server.ts` (`createMcpServer()` + `startDiagramSweeper()`), so tool behavior is identical over stdio and HTTP; `src/index.ts` is now a thin stdio entry point.
+
+**Tests**
+
+- New `http-server.test.js` (with `test-http-client.js`) covering: initialize / list tools / round-trip a diagram over HTTP, diagram state shared across independent MCP sessions on one server process, graceful handling of an unrecognised session id, and survival across multiple calls spread over several seconds. `npm test` now runs 16 tests across 4 files.
+- New `mcp-patches.test.js` stress test that bursts diagram creation/element-add/export in parallel and asserts every line on stdout is well-formed JSON-RPC, guarding the stdio-corruption fix above.
+
+### 1.1.0
+
+**Bug fixes**
+
+- **Concurrency:** every operation on a diagram (add, connect, export, list, inspect, import-related saves, browser saves) now runs under the per-diagram lock. Previously only browser saves and `list` / `inspect` were locked, so an MCP edit could land on a modeler that a browser save had just replaced and be lost.
+- **Diagram names:** `create_bpmn_diagram`'s `name` is now stored and returned by `create`, `list_bpmn_elements`, `inspect_bpmn_diagram` and `list_bpmn_diagrams`. `import_bpmn_xml` also accepts an optional `name`.
+- **Element stacking:** elements added without `x` / `y` are placed automatically (see [Automatic Placement](#automatic-placement)) instead of all landing at (100, 100). The response reports the actual position.
+- **Resource leaks:** replaced or deleted modelers are destroyed and their canvases removed from the jsdom document. Failed XML imports (via MCP or the browser Save) no longer leave an orphaned canvas behind.
+- **bpmn-js resolution:** the bundle is located with `require.resolve` instead of a hard-coded `../node_modules` path, so hoisted, global and `npx` installs work. It now loads the production bundle by default.
+
+**Additions**
+
+- New tools `list_bpmn_diagrams` and `delete_bpmn_diagram`; deleting a diagram also revokes its modeler URLs (`PreviewServer.closeForDiagram`).
+- Idle diagram expiry and a diagram-count cap, configurable through environment variables (see above).
+- Deleted or expired diagrams return a clear `Diagram was deleted` / `Diagram not found` error, including for operations that were queued when the delete happened.
+- `import_bpmn_xml` rejects empty input with a clear error.
+- Diagram IDs use `crypto.randomUUID()` instead of `Math.random()`.
+- The MCP server name and version are read from `package.json`.
+- Links to the BPMN 2.0 specification and bpmn.io added to the introduction and Related Projects.
+
+**Removed**
+
+- The unused `elementIdMap` state field.
+
+**Tests**
+
+- New `mcp-patches.test.js` (with a shared `test-client.js`) covering names and listing, delete and link revocation, auto-placement and overlap, boundary events and artifacts, concurrent edits, delete racing with edits, invalid imports, the diagram cap, TTL expiry, and running from a different working directory. `npm test` runs all suites (11 tests).
+
+**Not changed (candidates for a later release)**
+
+- Tool arguments are still cast with `as any` rather than validated with a schema library.
+- The XML is still re-serialised after each mutation.
+- Element update, delete and move tools, a validation tool, batch creation, and persistence across restarts.
+- CI workflow, committing `package-lock.json`, and the `bpmn-js-mcp` vs `bpmn-live-mcp` naming mismatch.
