@@ -1,4 +1,4 @@
-# BPMN-MCP
+# BPMN Live MCP
 
 A Model Context Protocol (MCP) server for creating and manipulating BPMN 2.0 workflow diagrams programmatically. This server enables AI assistants and other tools to generate, edit, and export business process diagrams in the standard BPMN format.
 
@@ -27,7 +27,7 @@ A Model Context Protocol (MCP) server for creating and manipulating BPMN 2.0 wor
 1. Clone the repository:
 ```bash
 git clone https://github.com/MykhailoPrykhodko/bpmn-live-mcp.git
-cd BPMN-MCP
+cd bpmn-live-mcp
 ```
 
 2. Install dependencies:
@@ -87,7 +87,7 @@ Add the server to an OpenCode project configuration at `.opencode/opencode.json`
 }
 ```
 
-Use the absolute path to your local BPMN-MCP project in `cwd`. Build the server before using it:
+Use the absolute path to your local `BPMN-MCP` project in `cwd`. Build the server before using it:
 
 ```bash
 npm install
