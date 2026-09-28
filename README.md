@@ -26,7 +26,7 @@ A Model Context Protocol (MCP) server for creating and manipulating BPMN 2.0 wor
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/dattmavis/BPMN-MCP.git
+git clone https://github.com/MykhailoPrykhodko/bpmn-live-mcp.git
 cd BPMN-MCP
 ```
 
@@ -68,6 +68,33 @@ This MCP server works with any tool that supports the Model Context Protocol. Co
 ```bash
 node /path/to/BPMN-MCP/dist/index.js
 ```
+
+### For OpenCode
+
+Add the server to an OpenCode project configuration at `.opencode/opencode.json` or to the global OpenCode configuration at `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "bpmn": {
+      "type": "local",
+      "command": ["node", "dist/index.js"],
+      "cwd": "C:\\Users\\mprykhodko\\Projects\\BPMN-MCP",
+      "enabled": true
+    }
+  }
+}
+```
+
+Use the absolute path to your local BPMN-MCP project in `cwd`. Build the server before using it:
+
+```bash
+npm install
+npm run build
+```
+
+Restart OpenCode after changing its MCP configuration. You can then ask OpenCode to create, inspect, edit, or export BPMN diagrams using the `bpmn` MCP tools.
 
 ## Usage
 
@@ -116,6 +143,34 @@ The modeler includes local-file open and drag-and-drop, a guarded **New** action
 The modeler runs on loopback only (`127.0.0.1`). The URL is tokenized and expires after one hour. If MCP changes the diagram while the browser has unsaved edits, the modeler reports a conflict instead of overwriting the newer change.
 
 To inspect the same live modeler session from chat, copy the token after `/modeler/` in the URL and call `inspect_bpmn_modeler`. The token is tied to the running MCP process and becomes invalid after that process restarts.
+
+### Using the Modeler from OpenCode
+
+1. Create or import a diagram in OpenCode:
+
+```text
+Create the archiving approval BPMN diagram and return its diagram ID.
+```
+
+2. Open the live modeler:
+
+```text
+Open the live BPMN modeler for diagram diagram_123
+```
+
+3. Open the returned local URL in a browser. Use the native bpmn-js palette and context pad to add tasks, events, gateways, lanes, participants, annotations, data objects, and connections.
+
+4. Click **Save** in the modeler, or press `Ctrl+S` / `Cmd+S`. Edits remain local until explicitly saved.
+
+5. Ask OpenCode to inspect the saved modeler session. Copy the token from the URL, which is the value after `/modeler/`:
+
+```text
+Inspect the live BPMN modeler using token 20a865e6d4217dade1c64448b9b9e2a70ad7dff5b615db14
+```
+
+OpenCode can use `inspect_bpmn_modeler` to resolve the token and read the latest diagram state. It can also use `inspect_bpmn_diagram` with the resolved diagram ID.
+
+The modeler provides separate **Download BPMN** and **Download SVG** actions. These downloads do not replace the explicit MCP Save action.
 
 ## Available Tools
 
